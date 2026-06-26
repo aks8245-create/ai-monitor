@@ -110,23 +110,69 @@ SHEET_HEADER = ["날짜", "병원", "플랫폼", "분류", "쿼리", "노출", "
 
 
 @st.cache_resource
+def _open_sheet():
+    info = sec("gcp_service_account")
+    sid = sec("SHEET_ID")
+    if not info or not sid:
+        return None
+    import gspread
+    from google.oauth2.service_account import Credentials
+    creds = Credentials.from_service_account_info(
+        dict(info), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return gspread.authorize(creds).open_by_key(sid)
+
+
+@st.cache_resource
 def get_ws():
     try:
-        info = sec("gcp_service_account")
-        sid = sec("SHEET_ID")
-        if not info or not sid:
+        sh = _open_sheet()
+        if sh is None:
             return None
-        import gspread
-        from google.oauth2.service_account import Credentials
-        creds = Credentials.from_service_account_info(
-            dict(info), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        ws = gspread.authorize(creds).open_by_key(sid).sheet1
+        ws = sh.sheet1
         if not ws.get_all_values():
             ws.append_row(SHEET_HEADER)
         return ws
     except Exception as e:
         st.sidebar.warning(f"구글시트 연결 실패: {e}")
         return None
+
+
+CONFIG_HEADER = ["병원", "aliases", "site", "blogs", "youtube", "competitors", "queries"]
+
+
+@st.cache_resource
+def get_config_ws():
+    try:
+        sh = _open_sheet()
+        if sh is None:
+            return None
+        import gspread
+        try:
+            cws = sh.worksheet("config")
+        except gspread.exceptions.WorksheetNotFound:
+            cws = sh.add_worksheet(title="config", rows=200, cols=10)
+            cws.append_row(CONFIG_HEADER)
+        if not cws.get_all_values():
+            cws.append_row(CONFIG_HEADER)
+        return cws
+    except Exception:
+        return None
+
+
+def save_config(cws, vals):
+    # vals: [병원, aliases, site, blogs, youtube, competitors, queries] — 항상 추가(최신이 우선)
+    cws.append_row(vals, value_input_option="USER_ENTERED")
+
+
+def load_config(cws, name):
+    found = None
+    for i, r in enumerate(cws.get_all_values()):
+        if i == 0 or not r or r[0] != name:
+            continue
+        rr = (r + [""] * 7)[:7]
+        found = dict(aliases=rr[1], site=rr[2], blogs=rr[3],
+                     youtube=rr[4], competitors=rr[5], queries=rr[6])
+    return found   # 같은 병원이 여러 번 저장됐으면 마지막(최신)
 
 
 def log_to_sheet(ws, entries, today, clinic):
@@ -244,18 +290,78 @@ def run_query(query, cfg, accurate):
 
 
 # ── 사이드바: 병원 설정 ────────────────────────────────────
+DEFAULT_QUERIES = "\n".join([
+    "여의도 산부인과 추천", "영등포 산부인과 잘하는 곳", "여의도 여의사 산부인과",
+    "비수술 요실금 치료 병원 서울", "반복되는 질염 잘 보는 병원",
+])
+
 st.sidebar.header("병원 설정")
 preset = st.sidebar.selectbox("프리셋", list(PRESETS.keys()))
 p = PRESETS[preset]
-name = st.sidebar.text_input("병원 이름", p["name"])
-aliases_s = st.sidebar.text_input("이름 별칭 (쉼표)", p["aliases"],
+
+# 프리셋이 바뀌면 입력 필드를 그 프리셋 값으로 초기화
+if st.session_state.get("_preset") != preset:
+    st.session_state["_preset"] = preset
+    st.session_state["f_name"] = p["name"]
+    st.session_state["f_aliases"] = p["aliases"]
+    st.session_state["f_site"] = p["site"]
+    st.session_state["f_blogs"] = p["blogs"]
+    st.session_state["f_youtube"] = p["youtube"]
+    st.session_state["f_comps"] = p["competitors"]
+st.session_state.setdefault("f_batch", DEFAULT_QUERIES)
+
+cfg_ws = get_config_ws()
+
+
+def _do_load():
+    if cfg_ws is None:
+        return
+    loaded = load_config(cfg_ws, st.session_state.get("f_name", "").strip())
+    if loaded:
+        st.session_state["f_aliases"] = loaded["aliases"]
+        st.session_state["f_site"] = loaded["site"]
+        st.session_state["f_blogs"] = loaded["blogs"]
+        st.session_state["f_youtube"] = loaded["youtube"]
+        st.session_state["f_comps"] = loaded["competitors"]
+        if loaded["queries"]:
+            st.session_state["f_batch"] = loaded["queries"]
+        st.session_state["_load_msg"] = "📂 저장된 설정을 불러왔어요."
+    else:
+        st.session_state["_load_msg"] = "저장된 설정이 없어요."
+
+
+def _do_save():
+    if cfg_ws is None:
+        return
+    nm = st.session_state.get("f_name", "").strip()
+    if not nm:
+        st.session_state["_load_msg"] = "병원 이름을 먼저 입력하세요."
+        return
+    save_config(cfg_ws, [nm, st.session_state.get("f_aliases", ""),
+                         st.session_state.get("f_site", ""),
+                         st.session_state.get("f_blogs", ""),
+                         st.session_state.get("f_youtube", ""),
+                         st.session_state.get("f_comps", ""),
+                         st.session_state.get("f_batch", "")])
+    st.session_state["_load_msg"] = "💾 설정을 저장했어요."
+
+
+name = st.sidebar.text_input("병원 이름", key="f_name")
+aliases_s = st.sidebar.text_input("이름 별칭 (쉼표)", key="f_aliases",
                                   help="같은 병원을 가리키는 다른 표기")
-site = st.sidebar.text_input("사이트 도메인", p["site"], help="예: honestclinic.com")
-blogs_s = st.sidebar.text_input("네이버블로그 ID (쉼표)", p["blogs"])
-youtube = st.sidebar.text_input("유튜브 채널명/핸들", p["youtube"])
-comps_s = st.sidebar.text_area("경쟁 병원 (선택 · 쉼표/줄바꿈)", p["competitors"],
+site = st.sidebar.text_input("사이트 도메인", key="f_site", help="예: honestclinic.com")
+blogs_s = st.sidebar.text_input("네이버블로그 ID (쉼표)", key="f_blogs")
+youtube = st.sidebar.text_input("유튜브 채널명/핸들", key="f_youtube")
+comps_s = st.sidebar.text_area("경쟁 병원 (선택 · 쉼표/줄바꿈)", key="f_comps",
                                height=80,
                                help="비워둬도 됩니다. 비우면 답변에서 병원명을 자동으로 찾아냅니다.")
+
+if cfg_ws is not None:
+    b1, b2 = st.sidebar.columns(2)
+    b1.button("💾 설정 저장", use_container_width=True, on_click=_do_save)
+    b2.button("📂 불러오기", use_container_width=True, on_click=_do_load)
+    if st.session_state.get("_load_msg"):
+        st.sidebar.caption(st.session_state.pop("_load_msg"))
 
 cfg = dict(
     name=name.strip(),
@@ -339,12 +445,9 @@ if results:
 
 # 기본 세트 일괄 실행
 with st.expander("기본 질문 세트 한 번에 돌리기 (선택)"):
-    st.caption("한 줄에 질문 하나. 전부 '발견형'으로 검색됩니다. 개수가 많으면 몇 분 걸려요.")
-    default_set = "\n".join([
-        "여의도 산부인과 추천", "영등포 산부인과 잘하는 곳", "여의도 여의사 산부인과",
-        "비수술 요실금 치료 병원 서울", "반복되는 질염 잘 보는 병원",
-    ])
-    batch = st.text_area("질문 목록", default_set, height=140)
+    st.caption("한 줄에 질문 하나. 전부 '발견형'으로 검색됩니다. "
+               "사이드바 [설정 저장]을 누르면 이 목록도 같이 저장돼요.")
+    batch = st.text_area("질문 목록", key="f_batch", height=140)
     if st.button("세트 전체 실행"):
         if not cfg["name"]:
             st.error("병원 이름을 먼저 설정하세요.")
