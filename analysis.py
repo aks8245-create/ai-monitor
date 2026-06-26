@@ -146,9 +146,10 @@ def extract_excerpt(text, aliases, maxlen=300):
     return text[start:end].strip()[:maxlen]
 
 
-def classify_citations(citations, site, blogs, youtube, aliases):
+def classify_citations(citations, site, blogs, youtube_names, aliases):
     """citations: [{url,title}]. 사이트/블로그/유튜브 인용 분류."""
     res = dict(site=False, blog=False, youtube=False, youtube_ours=False, domains=[])
+    yt = youtube_names if isinstance(youtube_names, (list, tuple)) else [youtube_names]
     for c in citations or []:
         u = (c.get("url") or "").lower()
         t = c.get("title") or ""
@@ -162,7 +163,8 @@ def classify_citations(citations, site, blogs, youtube, aliases):
         if "youtube.com" in u or "youtu.be" in u:
             res["youtube"] = True
             tn = norm(t)
-            if (youtube and norm(youtube) in tn) or any(norm(a) in tn for a in aliases if a.strip()):
+            if (any(norm(y) in tn for y in yt if y and y.strip())
+                    or any(norm(a) in tn for a in aliases if a.strip())):
                 res["youtube_ours"] = True
     return res
 
@@ -183,14 +185,20 @@ _S_OTH = 'font-size:12px;color:#8a8980;margin-top:5px'
 _S_PL = 'font-size:11px;color:#6b6a66;font-weight:600;width:54px;flex-shrink:0'
 
 
+_APOS = "(?:&#x27;|\u2019|\u2018|\u02bc|'|`)"  # 곡선·곧은·엔티티 따옴표 모두 매칭
+
+
 def _hl(text, aliases):
     safe = _html.escape(text or "")
     for a in aliases:
         a = a.strip()
         if not a:
             continue
-        safe = re.sub("(" + re.escape(_html.escape(a)) + ")",
-                      rf'<span style="{_S_HL}">\1</span>', safe)
+        esc = _html.escape(_canon(a))          # 별칭 따옴표 통일 후 이스케이프
+        parts = esc.split("&#x27;")            # 아포스트로피 자리에서 분할
+        pat = _APOS.join(re.escape(p) for p in parts)
+        safe = re.sub("(" + pat + ")",
+                      rf'<span style="{_S_HL}">\1</span>', safe, flags=re.IGNORECASE)
     return safe
 
 
@@ -311,8 +319,36 @@ h2{{font-size:15px;font-weight:600;margin:24px 0 8px}}
 
 
 # ── 집계 (점유율 / 인용 도메인) ─────────────────────────────
+def _merge_names(names):
+    """같은 병원의 다른 표기 통합. 짧은 이름이 긴 이름을 흡수 (부분일치 기준)."""
+    uniq = sorted({n.strip() for n in names if n.strip()}, key=lambda x: len(norm(x)))
+    canon_list = []   # (norm, 원본)
+    cmap = {}
+    for nm in uniq:
+        nn = norm(nm)
+        hit = None
+        for cn, orig in canon_list:
+            if cn and (cn in nn or nn in cn):
+                hit = orig
+                break
+        if hit:
+            cmap[nm] = hit
+        else:
+            canon_list.append((nn, nm))
+            cmap[nm] = nm
+    return cmap
+
+
 def share_of_voice(rows_by_query, aliases):
-    """전체 결과에서 병원별 등장 횟수. returns ([(label,count)], total_slots)."""
+    """전체 결과에서 병원별 등장 횟수 (표기 통합 적용). returns ([(label,count)], slots)."""
+    all_others = set()
+    for _q, _cat, prs in rows_by_query:
+        for r in prs:
+            for o in (r.get("others") or []):
+                if o.strip():
+                    all_others.add(o.strip())
+    cmap = _merge_names(all_others)
+
     counts = {}
     slots = 0
     for _q, _cat, prs in rows_by_query:
@@ -322,13 +358,37 @@ def share_of_voice(rows_by_query, aliases):
                 counts["우리 병원"] = counts.get("우리 병원", 0) + 1
             seen = set()
             for o in (r.get("others") or []):
-                key = o.strip()
+                key = cmap.get(o.strip(), o.strip())
                 if not key or norm(key) in seen:
                     continue
                 seen.add(norm(key))
                 counts[key] = counts.get(key, 0) + 1
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return items, slots
+
+
+def insight_line(rows_by_query, aliases):
+    """리포트 상단 자동 요약 한 줄 (#5)."""
+    def rate(plat):
+        rs = [pr for q, c, prs in rows_by_query if c == "발견형"
+              for pr in prs if pr["plat"] == plat]
+        hit = sum(1 for pr in rs if pr.get("exposed"))
+        n = len(rs)
+        return (round(hit / n * 100) if n else 0), n
+    gp, gn = rate("GPT")
+    mp, mn = rate("Gemini")
+    sov, _ = share_of_voice(rows_by_query, aliases)
+    us = next((c for l, c in sov if l == "우리 병원"), 0)
+    comp = next(((l, c) for l, c in sov if l != "우리 병원"), None)
+    parts = []
+    if gn:
+        parts.append(f"GPT 노출 {gp}%")
+    if mn:
+        parts.append(f"Gemini 노출 {mp}%")
+    parts.append(f"우리 등장 {us}회")
+    if comp:
+        parts.append(f"최다 경쟁사 {comp[0]} {comp[1]}회")
+    return " · ".join(parts)
 
 
 def domain_counts(rows_by_query, top=12):
@@ -436,8 +496,13 @@ def summary_html(rows_by_query, aliases):
     scard = ('background:linear-gradient(180deg,#fafaf8,#f3f3f0);border:1px solid #ececec;'
              'border-radius:12px;padding:16px 18px')
     sec = 'font-size:13px;font-weight:700;color:#2c2c2a;margin:16px 0 8px'
+    insight = _html.escape(insight_line(rows_by_query, aliases))
+    banner = (f'<div style="background:#0f6e56;color:#fff;border-radius:10px;'
+              f'padding:11px 16px;font-size:13.5px;font-weight:600;margin-bottom:16px">'
+              f'📊 {insight}</div>')
     return (
         f'<div style="max-width:840px;font-family:Pretendard,-apple-system,\'Malgun Gothic\',sans-serif">'
+        f'{banner}'
         f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">'
         f'<div style="{scard}"><div style="font-size:12px;color:#6b6a66;margin-bottom:6px">GPT 발견형 노출</div>'
         f'<div style="font-size:26px;font-weight:700;color:#2c2c2a">{g[0]}'
