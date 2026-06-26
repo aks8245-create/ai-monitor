@@ -367,11 +367,16 @@ if ws is not None:
     with st.expander("📈 월별 노출 추이 (구글시트 기록 기반)"):
         try:
             import pandas as pd
-            recs = ws.get_all_records()
-            df = pd.DataFrame(recs)
-            if cfg["name"] and "병원" in df:
+            vals = ws.get_all_values()
+            # 헤더 행이 있으면 제거 (칸 제목에 의존하지 않고 위치로 매핑)
+            if vals and vals[0][:2] == ["날짜", "병원"]:
+                vals = vals[1:]
+            cols = SHEET_HEADER
+            data = [(row + [""] * len(cols))[:len(cols)] for row in vals]
+            df = pd.DataFrame(data, columns=cols)
+            if cfg["name"]:
                 df = df[df["병원"] == cfg["name"]]
-            df = df[df.get("분류") == "발견형"] if "분류" in df else df
+            df = df[df["분류"] == "발견형"]
             if df.empty:
                 st.info("아직 발견형 기록이 없습니다. 검색을 하면 누적됩니다.")
             else:
