@@ -38,8 +38,8 @@ PRESETS = {
         aliases="어니스트 여성의원, 어니스트클리닉, Honest Women's Clinic",
         site="honestclinic.com",
         blogs="honestclinic, honest0601",
-        youtube="어니스트TV",
-        competitors="",
+        youtube="어니스트TV, Honest TV, honestclinic, 닥터 조혜진, 조혜진",
+        competitors="르샘여성의원, 에이스여성의원, 로앤산부인과 여의도점, 여의도성모병원",
     ),
     "(빈 양식 — 새 병원)": dict(
         name="", aliases="", site="", blogs="", youtube="", competitors=""),
@@ -262,7 +262,7 @@ cfg = dict(
     aliases=A.split_list(name + "," + aliases_s),
     site=site.strip(),
     blogs=A.split_list(blogs_s),
-    youtube=youtube.strip(),
+    youtube=A.split_list(youtube),
     competitors=A.split_list(comps_s),
 )
 
