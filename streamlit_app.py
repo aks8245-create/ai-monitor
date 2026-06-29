@@ -106,7 +106,8 @@ def get_gemini():
 
 # ── 구글시트 (선택) ────────────────────────────────────────
 SHEET_HEADER = ["날짜", "병원", "플랫폼", "분류", "쿼리", "노출", "사이트",
-                "블로그", "유튜브", "유튜브우리", "순위", "총병원", "함께언급", "출처도메인"]
+                "블로그", "유튜브", "유튜브우리", "순위", "총병원", "함께언급",
+                "출처도메인", "실행시각"]
 
 
 @st.cache_resource
@@ -175,7 +176,7 @@ def load_config(cws, name):
     return found   # 같은 병원이 여러 번 저장됐으면 마지막(최신)
 
 
-def log_to_sheet(ws, entries, today, clinic):
+def log_to_sheet(ws, entries, today, clinic, run_ts=""):
     rows = []
     for q, cat, prs in entries:
         for r in prs:
@@ -189,6 +190,7 @@ def log_to_sheet(ws, entries, today, clinic):
                 r.get("rank") or "", r.get("total") or "",
                 " | ".join(r.get("others") or []),
                 " | ".join(sorted(set(r.get("domains") or []))),
+                run_ts,
             ])
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
@@ -380,10 +382,10 @@ else:
     st.sidebar.caption("구글시트 미연결 (추이 기능 끔)")
 
 
-def maybe_log(entries, today):
+def maybe_log(entries, today, run_ts):
     if ws is not None and log_on and cfg["name"]:
         try:
-            log_to_sheet(ws, entries, today, cfg["name"])
+            log_to_sheet(ws, entries, today, cfg["name"], run_ts)
         except Exception as e:
             st.warning(f"시트 기록 실패: {e}")
 
@@ -404,7 +406,9 @@ accurate = o2.checkbox("정확 순위 모드 (AI 한 번 더 · 비용↑)")
 if "results" not in st.session_state:
     st.session_state["results"] = []
 
-today = datetime.now().strftime("%Y-%m-%d")
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+run_ts = now.strftime("%Y-%m-%d %H:%M")   # 회차 구분자
 
 if go and query.strip():
     if not cfg["name"]:
@@ -414,7 +418,7 @@ if go and query.strip():
             rows = run_query(query.strip(), cfg, accurate)
         entry = (query.strip(), "대조군" if is_control else "발견형", rows)
         st.session_state["results"].insert(0, entry)
-        maybe_log([entry], today)
+        maybe_log([entry], today, run_ts)
 
 results = st.session_state["results"]
 
@@ -462,7 +466,7 @@ with st.expander("기본 질문 세트 한 번에 돌리기 (선택)"):
                 st.session_state["results"].insert(0, e)
                 new_entries.append(e)
                 prog.progress((i + 1) / len(qs))
-            maybe_log(new_entries, today)
+            maybe_log(new_entries, today, run_ts)
             st.rerun()
 
 # 월별 추이 (구글시트 연결 시)
@@ -471,7 +475,6 @@ if ws is not None:
         try:
             import pandas as pd
             vals = ws.get_all_values()
-            # 헤더 행이 있으면 제거 (칸 제목에 의존하지 않고 위치로 매핑)
             if vals and vals[0][:2] == ["날짜", "병원"]:
                 vals = vals[1:]
             cols = SHEET_HEADER
@@ -479,15 +482,40 @@ if ws is not None:
             df = pd.DataFrame(data, columns=cols)
             if cfg["name"]:
                 df = df[df["병원"] == cfg["name"]]
-            df = df[df["분류"] == "발견형"]
+            df = df[df["분류"] == "발견형"].copy()
+
+            # 시연용: 5월 테스트 데이터 한 줄 추가 버튼
+            cset = st.columns([3, 1])
+            cset[1].button(
+                "5월 테스트 추가", use_container_width=True,
+                help="시연용. 5월 데이터를 넣어 선이 이어지는 모습을 미리 봅니다. 시트에서 지울 수 있어요.",
+                on_click=lambda: ws.append_rows([
+                    ["2026-05-20", cfg["name"], "GPT", "발견형", "(테스트)", "O",
+                     "X", "X", "X", "X", "", "", "", "", "2026-05-20 10:00 (테스트)"],
+                    ["2026-05-20", cfg["name"], "Gemini", "발견형", "(테스트)", "O",
+                     "X", "X", "X", "X", "", "", "", "", "2026-05-20 10:00 (테스트)"],
+                ], value_input_option="USER_ENTERED") if cfg["name"] else None)
+
             if df.empty:
                 st.info("아직 발견형 기록이 없습니다. 검색을 하면 누적됩니다.")
             else:
-                df["month"] = df["날짜"].astype(str).str[:7]
-                df["hit"] = (df["노출"] == "O").astype(int)
-                piv = (df.groupby(["month", "플랫폼"])["hit"].mean()
-                       .mul(100).round(0).unstack())
-                st.line_chart(piv)
-                st.caption("월별 발견형 노출률(%)")
+                # 회차 = 실행시각(없으면 날짜)
+                df["회차"] = df["실행시각"].where(df["실행시각"].astype(str) != "", df["날짜"])
+                runs = sorted(df["회차"].unique())
+                chosen = cset[0].multiselect(
+                    "표시할 회차 (체크 해제하면 그래프에서 숨김)", runs, default=runs)
+                df = df[df["회차"].isin(chosen)]
+
+                if df.empty:
+                    st.info("표시할 회차를 1개 이상 선택하세요.")
+                else:
+                    df["ym"] = df["날짜"].astype(str).str[:7]
+                    df["hit"] = (df["노출"] == "O").astype(int)
+                    piv = (df.groupby(["ym", "플랫폼"])["hit"].mean()
+                           .mul(100).round(0).unstack())
+                    # X축을 "6월/7월"로 표시
+                    piv.index = [f"{int(m[5:7])}월" if len(m) >= 7 else m for m in piv.index]
+                    st.line_chart(piv)
+                    st.caption("월별 발견형 노출률(%) · 선택한 회차 평균")
         except Exception as e:
             st.warning(f"추이 표시 실패: {e}")
